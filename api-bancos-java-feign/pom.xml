@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!-- Nota: Heredamos de Spring Boot 3.5.6 para no pelear con las versiones de las librerías -->
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.5.6</version>
+        <relativePath/>
+    </parent>
+
+    <!-- Datos base del proyecto -->
+    <groupId>gt.edu.umg.desarrolloweb.pagos</groupId>
+    <artifactId>api-bancos-java-feign</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+    <name>api-bancos-java-feign</name>
+    <description>Consumidor del simulador de Banco con Java Feign</description>
+
+    <properties>
+        <!-- Ojo: Java 17 es obligatorio aquí por SB -->
+        <java.version>17</java.version>
+        
+        <!-- Versión del generador de OpenAPI  -->
+        <openapi-generator.version>7.12.0</openapi-generator.version>
+    </properties>
+
+    <dependencies>
+        <!-- Para levantar el servidor web (Tomcat) y usar anotaciones de Spring -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        
+        <!-- Para que funcionen las validaciones en los DTOs generados (@NotNull, etc.) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <!--dependencias de abajo no venían por defecto -->
+        <dependency>
+            <groupId>io.github.openfeign</groupId>
+            <artifactId>feign-okhttp</artifactId>
+            <version>13.5</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.openfeign.form</groupId>
+            <artifactId>feign-form</artifactId>
+            <version>3.8.0</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.openfeign</groupId>
+            <artifactId>feign-slf4j</artifactId>
+            <version>13.5</version>
+        </dependency>
+        
+        <!-- El núcleo de Feign. Nos permite hacer las peticiones HTTP usando interfaces -->
+        <dependency>
+            <groupId>io.github.openfeign</groupId>
+            <artifactId>feign-core</artifactId>
+            <version>13.5</version>
+        </dependency>
+        <!-- Para que Feign entienda los JSON que van y vienen -->
+        <dependency>
+            <groupId>io.github.openfeign</groupId>
+            <artifactId>feign-jackson</artifactId>
+            <version>13.5</version>
+        </dependency>
+
+        <!-- Para conectarnos a la cola de RabbitMQ y escuchar los pagos -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
+        
+        <!-- Para hacer pruebas -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Plugin para poder correr la app con spring-boot:run -->
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- AQUÍ ESTÁ : El generador de código -->
+            
+            <plugin>
+                <groupId>org.openapitools</groupId>
+                <artifactId>openapi-generator-maven-plugin</artifactId>
+                <version>${openapi-generator.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-bank-client</id>
+                        <goals>
+                            <goal>generate</goal>
+                        </goals>
+                        <configuration>
+                            <!-- Aquí le decimos dónde está nuestro contrato (el YAML) -->
+                            <inputSpec>${project.basedir}/src/main/resources/openapi/bank-payments-api.yaml</inputSpec>
+                            
+                            <!-- Decidimos usar 'java' y 'feign' puro para el banco -->
+                            <generatorName>java</generatorName>
+                            <library>feign</library>
+                            
+                            <!-- Todo el código autogenerado se guarda en target, (por eso no lo tocamos a mano) -->
+                            <output>${project.build.directory}/generated-sources/openapi-bank</output>
+                            
+                            <!-- Paquetes donde irán las clases que se generen -->
+                            <apiPackage>gt.edu.umg.desarrolloweb.pagos.bank.client</apiPackage>
+                            <modelPackage>gt.edu.umg.desarrolloweb.pagos.bank.dto</modelPackage>
+                            
+                            <!-- Le agregamos 'Dto' al final a los modelos para saber que son de transferencia de datos -->
+                            <modelNameSuffix>Dto</modelNameSuffix>
+                            
+                            <configOptions>
+                                <!-- Necesario para que use jakarta.validation con Spring Boot 3 -->
+                                <useJakartaEe>true</useJakartaEe>
+                                <!-- Evita que meta anotaciones raras de nulos -->
+                                <openApiNullable>false</openApiNullable>
+                                <!-- Para usar las fechas de Java 8 en adelante -->
+                                <dateLibrary>java8</dateLibrary>
+                            </configOptions>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

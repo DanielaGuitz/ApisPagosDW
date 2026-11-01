@@ -1,0 +1,28 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: apis-rabbitmq
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Set RABBITMQ_DEFAULT_PASS in .env}
+
+  dynamodb-local:
+    image: amazon/dynamodb-local
+    container_name: apis-dynamodb
+    ports:
+      - "8000:8000"
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+
+  mysql-monolito:
+    image: mysql:8.0
+    container_name: apis-monolito-db
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-gota_db}
+    volumes:
+      - ./db:/docker-entrypoint-initdb.d
