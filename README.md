@@ -38,7 +38,7 @@ Este repositorio contiene el módulo de envío de pagos por colas junto con la i
 ### 2.1 Diagrama de arquitectura
 
 ![Diagrama de arquitectura del módulo de pagos por colas](docs/arquitectura.png)
-![Diagrama del módulo de pagos por colas](docs/flujo-procesamiento.png)
+
 
 ### 2.2 Componentes
 
