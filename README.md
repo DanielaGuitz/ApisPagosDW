@@ -35,39 +35,44 @@ Este repositorio contiene el módulo de envío de pagos por colas junto con la i
 
 ## 2. Arquitectura de la solución
 
-### 2.1 Diagramas
+### 2.1 Diagrama de arquitectura
 
-![Diagrama de arquitectura](docs/arquitecturaApis.png)
-![Diagrama de arquitectura](docs/DiagramaSecuencia.png)
-![Diagrama de arquitectura](docs/DiagramaActividades.png)
+![Diagrama de arquitectura del módulo de pagos por colas](docs/arquitectura.png)
+![Diagrama del módulo de pagos por colas](docs/flujo-procesamiento.png)
+
 ### 2.2 Componentes
 
 | Componente | Tipo | Qué hace | Ubicación |
 |------------|------|----------|-----------|
 | Monolito heredado | Aplicación web | Sistema central de la Oficina del Agua y origen de los pagos. No se modifica | — |
-| MySQL `gota_db` | Base de datos relacional | Base del monolito (tablas `Pagos`, `Lecturas`, `Contadores`, `Clientes`). En local corre en Docker y se inicializa con los scripts de `db/` | `docker-compose.yml`, `db/` |
-| RabbitMQ | Cola de mensajes | Exchange `pagos.exchange`; colas `pagos.banco` y `pagos.erp`; colas de errores `pagos.banco.dlq` y `pagos.erp.dlq` | `docker-compose.yml` |
+| MySQL `gota_db` | Base de datos relacional | Base del monolito (tablas `Pagos`, `Lecturas`, `Contadores`, `Clientes`, entre otras). En local corre en Docker; se crea con `db/gota_db.sql` y se llena con datos ficticios de `db/z_datos_prueba.sql` | `docker-compose.yml`, `db/` |
+| RabbitMQ | Cola de mensajes | Exchange `pagos.exchange` (direct); colas `pagos.banco` y `pagos.erp`; colas de errores `pagos.banco.dlq` y `pagos.erp.dlq` | `docker-compose.yml`, `RabbitConfig.java` |
+| `TestPagoController` | Controlador REST | Endpoints `GET /test/leer-y-enviar` y `GET /test/solo-producer` que disparan la lectura y la publicación de pagos | `api-bancos-spring-cloud/` |
 | `MonolitoPagoReader` | Componente Spring | Lee con JDBC los pagos con estado `Completado` y los convierte a `PagoOrigen` | `api-bancos-spring-cloud/` |
-| `PagoProducer` | Componente Spring | Publica cada pago en `pagos.exchange` (rutas `routing.banco` y `routing.erp`) usando `RabbitTemplate` | `api-bancos-spring-cloud/` |
-| `PagoConsumer` | Componente Spring | Escucha `pagos.banco` y `pagos.erp` (`@RabbitListener`), envía cada pago al sistema externo correspondiente y registra el resultado | `api-bancos-spring-cloud/` |
-| `ReprocesadorService` | Tarea programada | Cada 10 segundos revisa los envíos registrados en DynamoDB y reprocesa los que lo requieren | `api-bancos-spring-cloud/` |
-| `TestPagoController` | Controlador REST | Endpoints de prueba que disparan la lectura y el envío de pagos | `api-bancos-spring-cloud/` |
-| `common` | Librería Java | Modelo `PagoOrigen` y `RubroDetalle`, mappers (Banco y ERP), validaciones y `ClasificadorRespuesta` | `common/` |
-| `api-bancos-java-feign` | Cliente Java | Cliente Feign del API del Banco, generado con OpenAPI Generator (generador `java`) | `api-bancos-java-feign/` |
-| DynamoDB local | Base de datos NoSQL | Tablas `pagos_envio_estado` (estado de cada envío) y `pagos_envio_logs` (un registro por intento). Corre en memoria | `docker-compose.yml` |
-| API Gateway Banco / ERP | Sistemas externos | Simuladores en AWS provistos por el docente, definidos por contratos OpenAPI | Externo |
+| `PagoProducer` | Componente Spring | Publica cada pago en `pagos.exchange` con las rutas `routing.banco` y `routing.erp` (`RabbitTemplate`) | `api-bancos-spring-cloud/` |
+| `PagoConsumer` | Componente Spring | Escucha `pagos.banco` y `pagos.erp` (`@RabbitListener`), valida, mapea, envía al sistema externo, clasifica la respuesta y confirma el mensaje | `api-bancos-spring-cloud/` |
+| `AwsBancoClient` / `AwsErpClient` | Clientes HTTP | Envían la petición al API Gateway correspondiente con `java.net.http` (timeout de 3 s, cabecera `x-api-key`) | `api-bancos-spring-cloud/` |
+| `DynamoService` | Componente Spring | Guarda el log de cada intento y el estado de cada envío en DynamoDB | `api-bancos-spring-cloud/` |
+| `ReprocesadorService` | Tarea programada | Cada 10 segundos consulta en DynamoDB los envíos en estado `REINTENTO_PENDIENTE` | `api-bancos-spring-cloud/` |
+| `common` | Librería Java | `PagoOrigen`, `BancoMapper`, `ErpMapper`, `ValidadorPago`, `ClasificadorRespuesta` e `IdempotencyKeyFactory`, compartidos por ambos destinos | `common/` |
+| `api-bancos-java-feign` | Módulo Maven | Contrato OpenAPI del Banco y configuración de OpenAPI Generator (generador `java`, librería `feign`) | `api-bancos-java-feign/` |
+| DynamoDB local | Base de datos NoSQL | Tablas `pagos_envio_estado` y `pagos_envio_logs`. Corre en memoria | `docker-compose.yml` |
+| API Gateway Banco / ERP | Sistemas externos | Simuladores en AWS provistos por el docente, descritos por contratos OpenAPI | Externo |
 
 ### 2.3 Flujos (qué representa cada conexión)
 
-1. **Disparo:** una petición `GET` a `/test/leer-y-enviar` o `/test/solo-producer` (`TestPagoController`) inicia el proceso.
-2. **`MonolitoPagoReader` → MySQL `gota_db`:** consulta SQL (JDBC) de los pagos cobrados. El código del monolito no se toca; solo se lee su base de datos.
-3. **`PagoProducer` → RabbitMQ (`pagos.exchange`):** cada pago se publica como mensaje JSON y el exchange lo dirige a `pagos.banco` o `pagos.erp` según la ruta.
-4. **RabbitMQ → `PagoConsumer`:** el consumidor toma los mensajes de ambas colas con confirmación manual y hasta 3 reintentos.
-5. **`PagoConsumer` → `common`:** usa los mappers, validaciones y el `ClasificadorRespuesta` compartidos.
-6. **`PagoConsumer` → API Gateway Banco / ERP:** llamadas HTTP según los contratos OpenAPI (`POST /bank/v1/payments` y `POST /erp/v1/pagos`).
-7. **`PagoConsumer` → DynamoDB:** registra el estado y el log de cada intento.
-8. **`ReprocesadorService` ↔ DynamoDB:** cada 10 segundos revisa los estados registrados y reprocesa los pendientes.
-9. **Colas `*.dlq`:** reciben los mensajes que no pudieron procesarse tras agotar los reintentos.
+1. **Disparo:** una petición `GET` a `/test/leer-y-enviar` o `/test/solo-producer` inicia el proceso.
+2. **`MonolitoPagoReader` → MySQL `gota_db`:** consulta SQL (JDBC) de los pagos con estado `Completado`. El código del monolito no se toca; solo se lee su base de datos.
+3. **`PagoProducer` → RabbitMQ:** cada pago se publica como JSON en `pagos.exchange`; la ruta `routing.banco` lo dirige a `pagos.banco` y `routing.erp` a `pagos.erp`.
+4. **RabbitMQ → `PagoConsumer`:** el consumidor toma los mensajes de ambas colas con confirmación manual.
+5. **`PagoConsumer` → `common`:** valida el pago, lo mapea al formato del destino y clasifica la respuesta recibida.
+6. **Clientes HTTP → API Gateway Banco / ERP:** `POST /bank/v1/payments` y `POST /erp/v1/pagos`.
+7. **`PagoConsumer` → DynamoDB:** registra el log del intento y el estado del envío.
+8. **`ReprocesadorService` ↔ DynamoDB:** cada 10 segundos busca los envíos pendientes de reintento.
+
+El procesamiento detallado de un mensaje se resume en el siguiente diagrama:
+
+![Flujo de procesamiento de un pago en PagoConsumer](docs/flujo-procesamiento.png)
 
 ---
 
@@ -98,13 +103,14 @@ docker compose up -d
 | DynamoDB local | 8000 | Modo `-inMemory`: los registros se pierden al apagar el contenedor |
 | MySQL 8 (monolito) | 3306 | Base `gota_db`, inicializada con los scripts de `./db` |
 
+Los scripts de `./db` solo se ejecutan cuando el contenedor de MySQL se crea desde cero. Si ya se había levantado antes, reiniciar con `docker compose down -v` y luego `docker compose up -d`.
+
 ### Compilar
 
-No existe un `pom.xml` raíz: cada módulo se compila por separado. `common` debe instalarse primero porque los demás dependen de él.
+No existe un `pom.xml` raíz: cada módulo se compila por separado. `common` debe instalarse primero porque `api-bancos-spring-cloud` depende de él.
 
 ```bash
 cd common && ./mvnw clean install && cd ..
-cd api-bancos-java-feign && ./mvnw clean install && cd ..
 cd api-bancos-spring-cloud && ./mvnw clean install && cd ..
 ```
 
@@ -115,7 +121,7 @@ cd api-bancos-spring-cloud
 ./mvnw spring-boot:run
 ```
 
-La aplicación `api-bancos-spring-cloud` es la que contiene el productor, el consumidor y los endpoints de prueba. Usa el puerto 8080 por defecto. `api-bancos-java-feign` también usa 8080 por defecto, por lo que ambos módulos no deben ejecutarse al mismo tiempo.
+`api-bancos-spring-cloud` contiene el lector, el productor, el consumidor y los endpoints de prueba, por lo que es la única aplicación que se ejecuta para probar el flujo. Usa el puerto 8080 por defecto; `api-bancos-java-feign` también usa 8080 por defecto, así que no deben ejecutarse al mismo tiempo.
 
 ---
 
@@ -125,7 +131,7 @@ La aplicación `api-bancos-spring-cloud` es la que contiene el productor, el con
 
 El módulo toma los pagos cobrados en el monolito, los transforma al formato que exige cada sistema externo (**Banco** y **ERP**) y los envía de forma **asíncrona** mediante RabbitMQ.
 
-**Problema de negocio que resuelve:** si el envío fuera síncrono, la lentitud o la caída de un sistema externo (el Banco puede tardar varios segundos o fallar) afectaría el proceso de cobro o dejaría pagos sin reportar. Con la cola, el pago queda en espera, el monolito no depende de la disponibilidad externa y los fallos transitorios se reintentan sin perder información.
+**Problema de negocio que resuelve:** si el envío fuera síncrono, la lentitud o la caída de un sistema externo (el Banco puede tardar varios segundos o fallar) afectaría el proceso de cobro o dejaría pagos sin reportar. Con la cola, el pago queda en espera, el monolito no depende de la disponibilidad externa y los fallos se clasifican y registran sin perder información.
 
 ### 4.2 Integración y responsabilidades
 
@@ -133,7 +139,7 @@ El módulo toma los pagos cobrados en el monolito, los transforma al formato que
 |------------|-----------------|-----------------------|
 | Monolito | Origina y almacena los pagos | **Sin modificaciones**: el módulo solo lee su base de datos (`MonolitoPagoReader`) |
 | RabbitMQ | Transporte de mensajes | Aísla la disponibilidad del monolito de la de los sistemas externos |
-| `common` | Mappers, validación y clasificación de errores | Evita duplicar lógica entre Banco y ERP |
+| `common` | Validación, mapeo y clasificación de errores | Evita duplicar lógica entre Banco y ERP |
 | `PagoProducer` / `PagoConsumer` | Publicar y consumir pagos | Separa la lectura del monolito del envío a sistemas externos |
 | DynamoDB | Estado y bitácora de envíos | No carga ni altera la base relacional del monolito |
 | API Gateway Banco / ERP | Sistemas externos | Se consumen solo por HTTP según sus contratos OpenAPI |
@@ -142,107 +148,74 @@ Las claves y URLs se leen de variables de entorno (`.env`); no están en el cód
 
 ### 4.3 Decisiones técnicas
 
-**Decisión 1 – Clientes HTTP generados desde el contrato (OpenAPI Generator, contract-first).**
-Los contratos `.yaml` entregados definen las rutas y los DTOs de cada sistema. Generar los clientes Feign a partir de ellos mantiene el código alineado con el contrato real y evita errores al escribir las peticiones a mano. Alternativa descartada: escribir clientes y DTOs manualmente, más lento y propenso a desalinearse si el contrato cambia. Para el Banco se usó el generador `java` (Feign puro) y para el ERP el generador `spring` (Spring Cloud OpenFeign).
+**Decisión 1 – Contratos OpenAPI como fuente de verdad.**
+Los contratos `.yaml` entregados por el docente se incluyen en `src/main/resources/openapi/` y el plugin `openapi-generator-maven-plugin` (7.12.0) está configurado en ambos módulos: generador `java` con librería `feign` para el Banco, y `spring` con `spring-cloud` para el ERP. Así las rutas, los DTOs y la autenticación (`x-api-key`) quedan alineados con el contrato real y no se escriben a mano. El envío en ejecución lo realizan `AwsBancoClient` y `AwsErpClient` con `java.net.http`, que devuelven el código de estado y el cuerpo completos; con esos datos `ClasificadorRespuesta` decide qué hacer con cada mensaje, y el cliente permite fijar explícitamente los timeouts (3 s) y las cabeceras de idempotencia y de simulación de escenarios.
 
-**Decisión 2 – Colas de errores (DLQ), confirmación manual y reintentos.**
-Cada destino tiene su cola (`pagos.banco`, `pagos.erp`) y su cola de errores (`*.dlq`). El consumidor confirma manualmente (`acknowledge-mode=manual`) y reintenta hasta 3 veces con 2 segundos de intervalo inicial. Así un mensaje no se pierde si falla: se reintenta y, si no se logra, queda en la DLQ para revisión en lugar de bloquear la cola principal.
+**Decisión 2 – Confirmación manual y colas de errores (DLQ).**
+Cada destino tiene su cola (`pagos.banco`, `pagos.erp`) y su cola de errores (`*.dlq`), enlazada por `x-dead-letter-exchange`. El consumidor usa confirmación manual (`acknowledge-mode=manual`): solo hace `ACK` cuando el envío fue exitoso. Si el pago es inválido o el destino responde con un fallo, hace `NACK` sin reencolar y el mensaje pasa a la DLQ en lugar de bloquear la cola principal; si hay timeout o error de red, hace `NACK` con reencolado para volver a intentarlo.
 
-**Decisión 3 – `ClasificadorRespuesta`: reintentar solo lo que tiene sentido.**
+**Decisión 3 – `ClasificadorRespuesta`: la acción depende del tipo de fallo.**
 
-| Tipo | Códigos HTTP | Acción |
-|------|--------------|--------|
-| Reintentable (transitorio) | 429, 500, 503, 504 y timeout | Se reintenta |
-| Terminal (error de datos o de negocio) | 400, 403, 422 | No se reintenta |
+| Resultado | Códigos HTTP | Acción |
+|-----------|--------------|--------|
+| Éxito | 201; 409 con `DUPLICATE_PAYMENT` / `DOCUMENTO_DUPLICADO` | Log `EXITOSO`, estado `ENVIADO`, `ACK` |
+| Fallo temporal | 429, 500, 502, 503, 504 | Log `FALLIDO_TEMPORAL`, estado `REINTENTO_PENDIENTE`, `NACK` a la DLQ |
+| Fallo permanente | 400, 403, 422, otros 409 y cualquier otro código | Log `FALLIDO_PERMANENTE`, estado `FALLIDO_PERMANENTE`, `NACK` a la DLQ |
 
-Reintentar un 422 nunca lo arreglaría y solo saturaría la cola; reintentar un 503 sí tiene sentido porque el servicio puede recuperarse.
+Un 409 por duplicado se trata como éxito porque el destino ya tiene el pago (la llave de idempotencia evita registrarlo dos veces); un 422 nunca se arreglaría reenviándolo y un 503 sí puede recuperarse, por eso se registran con estados distintos.
 
 **Decisión 4 – Estado y bitácora de envíos en DynamoDB.**
-Cada pago se publica con una clave idempotente y cada intento queda registrado en `pagos_envio_estado` y `pagos_envio_logs`. Esto permite trazar un pago de punta a punta, evitar envíos duplicados y reprocesar los pendientes con `ReprocesadorService`, todo sin escribir en la base del monolito.
+Cada pago se envía con una llave de idempotencia (`IdempotencyKeyFactory`) y cada intento queda registrado en `pagos_envio_logs`, mientras que `pagos_envio_estado` guarda el estado actual del envío. Esto permite trazar un pago de punta a punta y detectar los pendientes (`ReprocesadorService`) sin escribir en la base del monolito.
 
 ### 4.4 Instrucciones para probar el módulo
 
 **Requisitos previos**
 
-- Haber completado la configuración y el `docker compose up -d` de la sección 3.
-- Tener en `.env` las URLs y API keys de los API Gateway entregadas por el docente (no se incluyen en el repositorio).
-- Tener compilados los módulos y la aplicación `api-bancos-spring-cloud` en ejecución (`./mvnw spring-boot:run`).
+- Haber hecho la configuración y el `docker compose up -d` de la sección 3. La base `gota_db` se carga con 6 pagos ficticios: 5 en estado `Completado` y 1 `Pendiente`.
+- Tener en `.env` las URLs y API keys de los API Gateway entregadas por el docente (no se incluyen en el repositorio). Sin ellas el consumidor no puede completar el envío.
+- Tener en ejecución `api-bancos-spring-cloud` (`./mvnw spring-boot:run`).
 
-**Paso 1 – Publicar los pagos en las colas**
+**Paso 1 – Flujo completo**
 
 Abrir en el navegador:
-
-```
-http://localhost:8080/test/solo-producer
-```
-
-El endpoint lee los pagos cobrados de la base del monolito (hasta 5 por lectura) y los publica en RabbitMQ.
-
-**Paso 2 – Verificar las colas**
-
-1. Abrir `http://localhost:15672` e iniciar sesión con el usuario y la clave de RabbitMQ definidos en `.env`.
-2. En la pestaña *Queues* revisar `pagos.banco` y `pagos.erp`: se ven los mensajes publicados y su procesamiento.
-
-**Paso 3 – Flujo completo (lectura y envío)**
-
-Abrir:
 
 ```
 http://localhost:8080/test/leer-y-enviar
 ```
 
-El `PagoConsumer` toma los mensajes de las colas, los mapea con los mappers de `common` y los envía a los API Gateway del Banco y del ERP. El avance se observa en la consola de la aplicación.
+**Resultado esperado:** la página responde `Se enviaron 5 pagos a RabbitMQ:` seguido de una línea por pago (por ejemplo `Pago ID: 1 | Cliente: Ana López | Monto: Q45.00`). El pago `Pendiente` no se envía. En la consola de la aplicación, cada mensaje aparece como `CONSUMER BANCO recibió pago` o `CONSUMER ERP recibió pago`, seguido de `Respuesta de AWS (...): HTTP <código>` y, si fue exitoso, `Pago EXITOSO. ACK`.
 
-**Paso 4 – Probar un mensaje manual**
+**Paso 2 – Verificar RabbitMQ**
 
-En RabbitMQ: *Queues* → `pagos.erp` (o `pagos.banco`) → *Publish message*, y pegar un mensaje como este:
+Abrir `http://localhost:15672` e iniciar sesión con el usuario y la clave de RabbitMQ definidos en `.env`. En la pestaña *Queues* se ven las colas `pagos.banco`, `pagos.erp`, `pagos.banco.dlq` y `pagos.erp.dlq`, con la actividad de mensajes publicados y entregados.
 
-```json
-{
-  "pagoId": 123,
-  "clienteCodigo": "CLI-45",
-  "clienteNombre": "Cliente de prueba",
-  "nit": "CF",
-  "contadorCodigo": "CONT-100",
-  "montoTotal": 125.50,
-  "rubros": [
-    {
-      "rubro": "AGUA_POTABLE",
-      "descripcion": "Consumo de agua",
-      "monto": 125.50
-    }
-  ],
-  "formaPago": "EFECTIVO",
-  "fechaPago": "2026-10-31T12:00:00-06:00[America/Guatemala]",
-  "periodoAnio": 2026,
-  "periodoMes": 10,
-  "concepto": "Pago desde monolito"
-}
+**Paso 3 – Verificar el registro en DynamoDB**
+
+Volver a abrir `http://localhost:8080/test/leer-y-enviar`: la consola de la aplicación imprime el contenido actual de las tablas `pagos_envio_estado` y `pagos_envio_logs`. Los pagos enviados con éxito aparecen con estado `ENVIADO` y un log `EXITOSO`.
+
+**Paso 4 – Simular un fallo con el escenario del simulador**
+
+El endpoint acepta el parámetro opcional `escenario`, que se envía al API Gateway en la cabecera `X-Simulation-Scenario`:
+
+```
+http://localhost:8080/test/leer-y-enviar?escenario=TIMEOUT
 ```
 
-Para simular un escenario de fallo se agrega al final del mensaje el sufijo `||` seguido del nombre del escenario (por ejemplo `||TIMEOUT`); el consumidor lo separa del JSON antes de procesarlo.
+**Resultado esperado:** el destino responde con un fallo o no responde en 3 s. Según el caso, el pago queda como `REINTENTO_PENDIENTE` (fallo temporal, mensaje a la DLQ) o como `FALLIDO_PERMANENTE` (mensaje a la DLQ), y la cola `pagos.*.dlq` correspondiente muestra el mensaje en el panel de RabbitMQ. Pasados unos segundos, la consola muestra `[REPROCESADOR] Encontrados ... pagos pendientes de reintento`.
 
-**Paso 5 – Revisar los registros en DynamoDB local**
+**Paso 5 – Probar solo la publicación**
 
-```bash
-AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local aws dynamodb scan \
-  --table-name pagos_envio_logs \
-  --endpoint-url http://localhost:8000 --region us-east-1
+```
+http://localhost:8080/test/solo-producer
 ```
 
-(Equivalente para la tabla `pagos_envio_estado`.)
-
-**Resultado esperado**
-
-- Los pagos aparecen como mensajes en `pagos.banco` y `pagos.erp` y luego son consumidos.
-- Cada pago se mapea al formato del sistema destino y se envía al API Gateway correspondiente.
-- Cada intento queda registrado en `pagos_envio_logs` y el estado del envío en `pagos_envio_estado`.
-- Con un escenario de fallo transitorio (por ejemplo `TIMEOUT`), el `ClasificadorRespuesta` lo clasifica como reintentable y el mensaje se reintenta hasta 3 veces; si se agotan los reintentos, pasa a la cola `*.dlq`.
+Lee los pagos, publica el primero (con escenario `SUCCESS`) en `pagos.banco` y `pagos.erp`, y responde `Prueba de Productor exitosa`. En la consola se ven los pasos `[PRODUCER-TEST] 1.` a `4.`.
 
 ### 4.5 Alcance de la implementación
 
 - `MonolitoPagoReader` lee hasta **5 pagos** por consulta con estado `Completado`.
 - La base del monolito no almacena NIT: se envía `CF` (Consumidor Final). El monto de cada pago se asigna al rubro "Agua potable".
+- `ReprocesadorService` identifica los envíos en `REINTENTO_PENDIENTE` y los marca como `EN_PROCESO`; no vuelve a publicarlos en la cola.
 - DynamoDB local corre en memoria: los registros se reinician al apagar el contenedor.
 
 ---
@@ -251,4 +224,4 @@ AWS_ACCESS_KEY_ID=local AWS_SECRET_ACCESS_KEY=local aws dynamodb scan \
 
 - No se publican contraseñas, API keys, tokens ni archivos `.env`.
 - Las credenciales se leen de variables de entorno; el repositorio incluye `.env.example` con valores ficticios.
-- El repositorio se inició sin historial previo y se verificó que no contiene secretos.
+- El repositorio se inició sin secretos en sus archivos ni en su historial.
